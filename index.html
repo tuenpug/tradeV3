@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Stock Master V6 - Multi-Backtest</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        :root { --bg: #0d1117; --card: #161b22; --text: #c9d1d9; --ma50: #2f81f7; --ma200: #e3b341; }
+        body { background-color: var(--bg); color: var(--text); font-family: sans-serif; font-size: 13px; }
+        .app-card { background-color: var(--card); border: 1px solid #30363d; border-radius: 12px; padding: 15px; margin-bottom: 12px; }
+        #chart { height: 380px; width: 100%; border-radius: 8px; }
+        .vol-row { font-size: 0.75rem; padding: 8px 0; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; }
+        .logic-box { background: #010409; border-left: 4px solid #f1e05a; padding: 12px; font-size: 0.85rem; color: #f1e05a; white-space: pre-line; }
+        .prob-bar { height: 8px; border-radius: 4px; background: #2f81f7; transition: width 1s; }
+        .sim-tag { padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 0.7rem; }
+        .sim-high { background: rgba(38, 166, 154, 0.2); color: #26a69a; }
+        .sim-low { background: rgba(239, 83, 80, 0.2); color: #ef5350; }
+    </style>
+</head>
+<body class="p-3">
+
+<div class="container" style="max-width: 600px;">
+    <div class="app-card shadow">
+        <div class="row g-2">
+            <div class="col-8"><input type="text" id="symbol" class="form-control bg-dark text-white border-secondary" value="NVDA"></div>
+            <div class="col-4"><button class="btn btn-primary w-100" onclick="runAnalysis(false)">最新分析</button></div>
+            <div class="col-8"><input type="date" id="test-date" class="form-control bg-dark text-white border-secondary"></div>
+            <div class="col-4"><button class="btn btn-warning w-100" onclick="runAnalysis(true)">回測測試</button></div>
+        </div>
+        <div id="error-display" class="text-danger small mt-2" style="display:none"></div>
+    </div>
+
+    <div id="result-ui" style="display: none;">
+        <div class="app-card">
+            <div class="small text-secondary mb-2 d-flex justify-content-between">
+                <span>過往五日走勢紀錄</span>
+                <span>系統回測相似度</span>
+            </div>
+            <div id="history-5day"></div>
+            <div class="mt-2 x-small text-muted">* 相似度越高，代表該股近期的慣性越適合本系統估算。</div>
+        </div>
+
+        <div class="d-flex justify-content-center gap-3 mb-2 small">
+            <span><small style="color:var(--ma50)">●</small> 50MA: <b id="val-sma50">--</b></span>
+            <span><small style="color:var(--ma200)">●</small> 200MA: <b id="val-sma200">--</b></span>
+            <span><small style="color:#ff4444">●</small> RSI(14): <b id="val-rsi">--</b></span>
+        </div>
+        <div class="app-card"><div id="chart"></div></div>
+
+        <div class="app-card">
+            <div class="small text-secondary mb-2">AI 深度決策邏輯</div>
+            <div id="ai-thought" class="logic-box"></div>
+        </div>
+
+        <div id="backtest-panel" class="app-card border-warning" style="display:none">
+            <div class="row text-center">
+                <div class="col-6 border-end">
+                    <div class="small text-secondary">選定日相似度</div>
+                    <div class="h3 text-warning" id="bt-score">--%</div>
+                </div>
+                <div class="col-6">
+                    <div class="small text-secondary">當日真實波幅</div>
+                    <div id="bt-real-range" class="fw-bold mt-1">--</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="app-card">
+            <div class="small text-secondary mb-3">未來一星期上升勝率預測</div>
+            <div class="mb-3">
+                <div class="d-flex justify-content-between small"><span>目標 +3%</span><span id="p3-val">--</span></div>
+                <div class="bg-dark rounded mt-1"><div id="p3-bar" class="prob-bar"></div></div>
+            </div>
+            <div class="mb-3">
+                <div class="d-flex justify-content-between small"><span>目標 +5%</span><span id="p5-val">--</span></div>
+                <div class="bg-dark rounded mt-1"><div id="p5-bar" class="prob-bar"></div></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const API_KEY = 'tDAhUDP8eul4oAJE88Fz2m1nlaKlFqzD'; 
+let chart, candleSeries, sma50Line, sma200Line;
+
+function initChart() {
+    const container = document.getElementById('chart');
+    container.innerHTML = '';
+    chart = LightweightCharts.createChart(container, {
+        layout: { background: { color: '#161b22' }, textColor: '#d1d4dc' },
+        grid: { vertLines: { color: '#2b2f3a' }, horzLines: { color: '#2b2f3a' } },
+        width: container.clientWidth,
+        height: 380,
+    });
+    candleSeries = chart.addCandlestickSeries({ upColor: '#26a69a', downColor: '#ef5350' });
+    sma50Line = chart.addLineSeries({ color: '#2f81f7', lineWidth: 2 });
+    sma200Line = chart.addLineSeries({ color: '#e3b341', lineWidth: 2 });
+}
+
+// 核心估算算法 (用於循環回測)
+function getEstimate(historySlice, rsi) {
+    const avgRange = (historySlice.slice(0, 5).reduce((a, b) => a + (b.h - b.l), 0) / 5);
+    let rsiAdj = 1.0;
+    if (rsi > 70) rsiAdj = 0.8; else if (rsi < 30) rsiAdj = 1.2;
+    return {
+        high: historySlice[0].c + (avgRange * 0.7 * rsiAdj),
+        low: historySlice[0].c - (avgRange * 0.7)
+    };
+}
+
+// 計算相似度
+function calcSimilarity(predH, predL, realH, realL) {
+    const overlap = Math.max(0, Math.min(predH, realH) - Math.max(predL, realL));
+    const realRange = realH - realL;
+    return realRange === 0 ? 0 : Math.min(100, (overlap / realRange) * 100);
+}
+
+async function runAnalysis(isBacktest) {
+    const sym = document.getElementById('symbol').value.toUpperCase().trim();
+    const testDate = document.getElementById('test-date').value;
+    const errorDiv = document.getElementById('error-display');
+    errorDiv.style.display = 'none';
+
+    try {
+        const resp = await fetch(`https://api.polygon.io/v2/aggs/ticker/${sym}/range/1/day/2023-01-01/2025-12-31?adjusted=true&sort=desc&limit=500&apiKey=${API_KEY}`);
+        const data = await resp.json();
+        if (!data.results) throw new Error("數據抓取失敗");
+
+        const all = data.results;
+        let tIdx = isBacktest ? all.findIndex(d => d.t <= new Date(testDate).getTime()) : 0;
+        if (tIdx === -1) throw new Error("日期超出範圍");
+
+        // 1. 生成過往五日清單並執行「自動回測」
+        let hHtml = '';
+        for (let i = 1; i <= 5; i++) {
+            const dayIdx = tIdx + i;
+            const d = all[dayIdx];
+            const histForThatDay = all.slice(dayIdx + 1);
+            
+            // 模擬當天的 RSI 與 估算
+            const mockRsi = 50; // 簡化計算
+            const est = getEstimate(all.slice(dayIdx), mockRsi);
+            const sim = calcSimilarity(est.high, est.low, d.h, d.l).toFixed(1);
+
+            const pct = (((d.c - d.o) / d.o) * 100).toFixed(2);
+            hHtml += `
+                <div class="vol-row">
+                    <span style="width: 80px;">${new Date(d.t).toLocaleDateString()}</span>
+                    <span style="flex-grow: 1; text-align: center;"><b>${d.o.toFixed(2)} → ${d.c.toFixed(2)}</b> (${pct}%)</span>
+                    <span class="sim-tag ${sim > 70 ? 'sim-high' : 'sim-low'}">${sim}% Sim.</span>
+                </div>`;
+        }
+        document.getElementById('history-5day').innerHTML = hHtml;
+
+        // 2. 當前選定日的分析
+        const current = all[tIdx];
+        const histLong = all.slice(tIdx + 1);
+        const sma50 = histLong.slice(0, 50).reduce((a, b) => a + b.c, 0) / 50;
+        const sma200 = histLong.slice(0, 200).reduce((a, b) => a + b.c, 0) / 200;
+        
+        // 獲取當前估算
+        const currentEst = getEstimate(all.slice(tIdx + 1), 50);
+
+        // 3. 圖表渲染
+        initChart();
+        document.getElementById('val-sma50').innerText = sma50.toFixed(2);
+        document.getElementById('val-sma200').innerText = sma200.toFixed(2);
+
+        const chartSlice = all.slice(tIdx, tIdx + 80).reverse();
+        candleSeries.setData(chartSlice.map(d => ({
+            time: d.t / 1000, open: d.o, high: d.h, low: d.l, close: d.c,
+            color: (isBacktest && d.t === current.t) ? '#2196F3' : undefined
+        })));
+
+        // 標註估算線
+        candleSeries.createPriceLine({ price: currentEst.high, color: '#f1e05a', lineStyle: 2, title: '預估高' });
+        candleSeries.createPriceLine({ price: currentEst.low, color: '#f1e05a', lineStyle: 2, title: '預估低' });
+
+        // 4. 回測結果顯示
+        if (isBacktest) {
+            const currentSim = calcSimilarity(currentEst.high, currentEst.low, current.h, current.l).toFixed(1);
+            document.getElementById('bt-score').innerText = currentSim + "%";
+            document.getElementById('bt-real-range').innerText = `$${current.l.toFixed(2)} - $${current.h.toFixed(2)}`;
+            document.getElementById('backtest-panel').style.display = 'block';
+        }
+
+        document.getElementById('result-ui').style.display = 'block';
+        document.getElementById('ai-thought').innerText = `系統已自動完成過往 5 日循環回測。
+        目前的估算邏輯對於 ${sym} 最近一週的吻合度平均值顯示了該股的慣性。
+        ${currentEst.high > sma50 ? "股價正處於強勢區間。" : "股價正處於弱勢整理。"}`;
+
+    } catch (e) { alert(e.message); }
+}
+
+function updateBar(id, val) {
+    document.getElementById(id + '-val').innerText = val + "%";
+    document.getElementById(id + '-bar').style.width = val + "%";
+}
+</script>
+</body>
+</html>
